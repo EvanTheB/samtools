@@ -69,7 +69,7 @@ int main_bedcov(int argc, char *argv[])
     hts_idx_t **idx;
     aux_t **aux;
     int *n_plp, dret, i, j, m, n, c, min_mapQ = 0, skip_DN = 0;
-    int64_t *cnt;
+    int64_t *cnt = NULL;
     const bam_pileup1_t **plp;
     int usage = 0;
 
@@ -121,6 +121,13 @@ int main_bedcov(int argc, char *argv[])
     }
     cnt = calloc(n, 8);
 
+    int64_t **mode = calloc(n, sizeof *mode);
+    size_t mode_size = 1024;
+    for (int i = 0; i < n; ++i)
+    {
+        mode[i] = calloc(mode_size, sizeof **mode);
+    }
+
     fp = gzopen(argv[optind], "rb");
     ks = ks_init(fp);
     n_plp = calloc(n, sizeof(int));
@@ -156,6 +163,12 @@ int main_bedcov(int argc, char *argv[])
         mplp = bam_mplp_init(n, read_bam, (void**)aux);
         bam_mplp_set_maxcnt(mplp, 64000);
         memset(cnt, 0, 8 * n);
+
+        for (int i = 0; i < n; ++i)
+        {
+            memset(mode[i], 0, mode_size * sizeof **mode);
+        }
+
         while (bam_mplp_auto(mplp, &tid, &pos, n_plp, plp) > 0)
             if (pos >= beg && pos < end) {
                 for (i = 0, m = 0; i < n; ++i) {
@@ -164,12 +177,51 @@ int main_bedcov(int argc, char *argv[])
                             const bam_pileup1_t *pi = plp[i] + j;
                             if (pi->is_del || pi->is_refskip) ++m;
                         }
-                    cnt[i] += n_plp[i] - m;
+                    // TODO evan guesing from context
+                    // definitely no-read positions are skipped
+                    // possible other worse mistakes
+                    int64_t depth = n_plp[i] - m;
+                    cnt[i] += depth;
+                    if (depth > mode_size)
+                    {
+                        mode_size = depth * 2;
+                        for (int i = 0; i < n; ++i)
+                        {
+                            mode[i] = realloc(mode, mode_size * sizeof **mode);
+                        }
+                    }
+                    mode[i][depth]++;
                 }
             }
         for (i = 0; i < n; ++i) {
             kputc('\t', &str);
             kputl(cnt[i], &str);
+
+            size_t this_min = 0;
+            int64_t this_mode = 0;
+            int64_t this_max = 0;
+            int j;
+            for (j = 0; j < mode_size; ++j)
+            {
+                if (mode[i][j] > 0)
+                {
+                    this_min = j;
+                    break;
+                }
+            }
+            for (; j < mode_size; ++j)
+            {
+                if (mode[i][j] > mode[i][this_mode])
+                    this_mode = j;
+                if (mode[i][j] > 0)
+                    this_max = j;
+            }
+            kputc('\t', &str);
+            kputl(this_min, &str);
+            kputc('\t', &str);
+            kputl(this_mode, &str);
+            kputc('\t', &str);
+            kputl(this_max, &str);
         }
         puts(str.s);
         bam_mplp_destroy(mplp);
@@ -183,6 +235,12 @@ bed_error:
     gzclose(fp);
 
     free(cnt);
+    if (mode)
+        for (int i = 0; i < n; ++i)
+        {
+            free(mode[i]);
+        }
+    free(mode);
     for (i = 0; i < n; ++i) {
         if (aux[i]->iter) hts_itr_destroy(aux[i]->iter);
         hts_idx_destroy(idx[i]);
