@@ -64,14 +64,18 @@ static int read_bam(void *data, bam1_t *b)
 int main_bedcov(int argc, char *argv[])
 {
     gzFile fp;
-    kstring_t str;
-    kstream_t *ks;
-    hts_idx_t **idx;
-    aux_t **aux;
-    int *n_plp, dret, i, j, m, n, c, min_mapQ = 0, skip_DN = 0;
+    kstring_t str = { 0, 0, NULL };
+    kstream_t *ks = NULL;
+    hts_idx_t **idx = NULL;
+    aux_t **aux = NULL;
+    int *n_plp = NULL;
+    int dret, i, j, m, n, c, min_mapQ = 0, baseQ = 0, skip_DN = 0;
     int64_t *cnt = NULL;
-    const bam_pileup1_t **plp;
+    int64_t **histogram = NULL;
+    size_t histogram_size = 1024;
+    const bam_pileup1_t **plp = NULL;
     int usage = 0;
+    int status = EXIT_SUCCESS;
 
     sam_global_args ga = SAM_GLOBAL_ARGS_INIT;
     static const struct option lopts[] = {
@@ -79,9 +83,10 @@ int main_bedcov(int argc, char *argv[])
         { NULL, 0, NULL, 0 }
     };
 
-    while ((c = getopt_long(argc, argv, "Q:j", lopts, NULL)) >= 0) {
+    while ((c = getopt_long(argc, argv, "Q:q:j", lopts, NULL)) >= 0) {
         switch (c) {
         case 'Q': min_mapQ = atoi(optarg); break;
+        case 'q': baseQ = atoi(optarg); break;   // base quality threshold
         case 'j': skip_DN = 1; break;
         default:  if (parse_sam_global_opt(c, optarg, lopts, &ga) == 0) break;
                   /* else fall-through */
@@ -93,49 +98,67 @@ int main_bedcov(int argc, char *argv[])
         fprintf(stderr, "Usage: samtools bedcov [options] <in.bed> <in1.bam> [...]\n\n");
         fprintf(stderr, "Options:\n");
         fprintf(stderr, "      -Q <int>            mapping quality threshold [0]\n");
+        fprintf(stderr, "      -q <int>            base quality threshold [0]\n");
         fprintf(stderr, "      -j                  do not include deletions (D) and ref skips (N) in bedcov computation\n");
         sam_global_opt_help(stderr, "-.--.-");
         return 1;
     }
     memset(&str, 0, sizeof(kstring_t));
     n = argc - optind - 1;
-    aux = calloc(n, sizeof(aux_t*));
-    idx = calloc(n, sizeof(hts_idx_t*));
+
+    fp = gzopen(argv[optind], "rb");
+    if (!fp) {
+        fprintf(stderr, "ERROR: fail to open bed file '%s'\n", argv[optind]);
+        status = 2;
+        goto bed_error_init;
+    }
+
+    aux = calloc(n, sizeof *aux);
+    idx = calloc(n, sizeof *idx);
+    cnt = calloc(n, sizeof *cnt);
+    histogram = calloc(n, sizeof *histogram);
+    n_plp = calloc(n, sizeof *n_plp);
+    plp = calloc(n, sizeof *plp);
+    ks = ks_init(fp);
+    if (!(aux && idx && cnt && histogram && n_plp && plp && ks)) {
+        status = EXIT_FAILURE;
+        goto bed_error_init;
+    }
+    for (i = 0; i < n; ++i)
+    {
+        histogram[i] = calloc(histogram_size, sizeof **histogram);
+        aux[i] = calloc(1, sizeof **aux);
+        if (!(histogram[i] && aux[i])) {
+            status = EXIT_FAILURE;
+            goto bed_error_init;
+        }
+    }
+
     for (i = 0; i < n; ++i) {
-        aux[i] = calloc(1, sizeof(aux_t));
         aux[i]->min_mapQ = min_mapQ;
         aux[i]->fp = sam_open_format(argv[i+optind+1], "r", &ga.in);
         if (aux[i]->fp)
             idx[i] = sam_index_load(aux[i]->fp, argv[i+optind+1]);
         if (aux[i]->fp == 0 || idx[i] == 0) {
             fprintf(stderr, "ERROR: fail to open index BAM file '%s'\n", argv[i+optind+1]);
-            return 2;
+            status = 2;
+            goto bed_error_init;
         }
         // TODO bgzf_set_cache_size(aux[i]->fp, 20);
         aux[i]->header = sam_hdr_read(aux[i]->fp);
         if (aux[i]->header == NULL) {
             fprintf(stderr, "ERROR: failed to read header for '%s'\n",
                     argv[i+optind+1]);
-            return 2;
+            status = 2;
+            goto bed_error_init;
         }
     }
-    cnt = calloc(n, 8);
 
-    int64_t **mode = calloc(n, sizeof *mode);
-    size_t mode_size = 1024;
-    for (int i = 0; i < n; ++i)
-    {
-        mode[i] = calloc(mode_size, sizeof **mode);
-    }
-
-    fp = gzopen(argv[optind], "rb");
-    ks = ks_init(fp);
-    n_plp = calloc(n, sizeof(int));
-    plp = calloc(n, sizeof(bam_pileup1_t*));
     while (ks_getuntil(ks, KS_SEP_LINE, &str, &dret) >= 0) {
         char *p, *q;
         int tid, beg, end, pos;
         bam_mplp_t mplp;
+        int last_pos = -1;
 
         if (str.l == 0 || *str.s == '#') continue; /* empty or comment line */
         /* Track and browser lines.  Also look for a trailing *space* in
@@ -162,66 +185,100 @@ int main_bedcov(int argc, char *argv[])
         }
         mplp = bam_mplp_init(n, read_bam, (void**)aux);
         bam_mplp_set_maxcnt(mplp, 64000);
-        memset(cnt, 0, 8 * n);
+        memset(cnt, 0, n * sizeof *cnt);
 
-        for (int i = 0; i < n; ++i)
+        for (i = 0; i < n; ++i)
         {
-            memset(mode[i], 0, mode_size * sizeof **mode);
+            memset(histogram[i], 0, histogram_size * sizeof **histogram);
         }
 
-        while (bam_mplp_auto(mplp, &tid, &pos, n_plp, plp) > 0)
+        while (bam_mplp_auto(mplp, &tid, &pos, n_plp, plp) > 0) {
             if (pos >= beg && pos < end) {
+                // Don't deal with missing portions of previous tids, we iterate only 1 tid
+                // Deal with missing portion of current tid
+                if (last_pos + 1 < pos) {
+                    int skipped = 0;
+                    if (last_pos < beg) {
+                        skipped = pos - beg;
+                    } else {
+                        skipped = pos - last_pos;
+                    }
+                    for (i = 0; i < n; ++i) {
+                        histogram[i][0] += skipped;
+                    }
+                }
+                last_pos = pos;
                 for (i = 0, m = 0; i < n; ++i) {
+                    // deletion skip
                     if (skip_DN)
                         for (j = 0; j < n_plp[i]; ++j) {
                             const bam_pileup1_t *pi = plp[i] + j;
                             if (pi->is_del || pi->is_refskip) ++m;
                         }
-                    // TODO evan guesing from context
-                    // definitely no-read positions are skipped
-                    // possible other worse mistakes
-                    int64_t depth = n_plp[i] - m;
+                    // low base quality filter
+                    if (baseQ)
+                        for (j = 0; j < n_plp[i]; ++j) {
+                            const bam_pileup1_t *pi = plp[i] + j;
+                            if (!(pi->is_del || pi->is_refskip) &&
+                                pi->qpos < pi->b->core.l_qseq &&
+                                bam_get_qual(pi->b)[pi->qpos] < baseQ) ++m;
+                        }
+
+                    unsigned depth = n_plp[i] - m;
                     cnt[i] += depth;
-                    if (depth > mode_size)
-                    {
-                        mode_size = depth * 2;
-                        for (int i = 0; i < n; ++i)
-                        {
-                            mode[i] = realloc(mode, mode_size * sizeof **mode);
+                    if (depth > histogram_size) {
+                        size_t old_size = histogram_size;
+                        histogram_size = depth * 2;
+                        for (i = 0; i < n; ++i) {
+                            int64_t *new = realloc(histogram, histogram_size * sizeof **histogram);
+                            if (!new) {
+                                goto bed_error;
+                            }
+                            histogram[i] = new;
+                            memset(histogram[i] + old_size, 0, (histogram_size - old_size) * sizeof **histogram);
                         }
                     }
-                    mode[i][depth]++;
+                    histogram[i][depth]++;
                 }
             }
+        }
+        // deal with depth 0 before end of range
+        if (last_pos < end - 1) {
+            for (i = 0; i < n; ++i){
+                histogram[i][0] += end - last_pos - 1;
+            }
+        }
         for (i = 0; i < n; ++i) {
+            size_t j;
             kputc('\t', &str);
             kputl(cnt[i], &str);
 
-            size_t this_min = 0;
-            int64_t this_mode = 0;
-            int64_t this_max = 0;
-            int j;
-            for (j = 0; j < mode_size; ++j)
+            // Want to use size_t, but kput has no size_t / 64 bit print
+            long min = 0;
+            long mode = 0;
+            long max = 0;
+            for (j = 0; j < histogram_size; ++j)
             {
-                if (mode[i][j] > 0)
+                if (histogram[i][j] > 0)
                 {
-                    this_min = j;
+                    min = j;
+                    mode = j;
                     break;
                 }
             }
-            for (; j < mode_size; ++j)
+            for (; j < histogram_size; ++j)
             {
-                if (mode[i][j] > mode[i][this_mode])
-                    this_mode = j;
-                if (mode[i][j] > 0)
-                    this_max = j;
+                if (histogram[i][j] > histogram[i][mode])
+                    mode = j;
+                if (histogram[i][j] > 0)
+                    max = j;
             }
             kputc('\t', &str);
-            kputl(this_min, &str);
+            kputl(min, &str);
             kputc('\t', &str);
-            kputl(this_mode, &str);
+            kputl(mode, &str);
             kputc('\t', &str);
-            kputl(this_max, &str);
+            kputl(max, &str);
         }
         puts(str.s);
         bam_mplp_destroy(mplp);
@@ -229,27 +286,33 @@ int main_bedcov(int argc, char *argv[])
 
 bed_error:
         fprintf(stderr, "Errors in BED line '%s'\n", str.s);
+        status = EXIT_FAILURE;
     }
+bed_error_init:
     free(n_plp); free(plp);
     ks_destroy(ks);
     gzclose(fp);
 
     free(cnt);
-    if (mode)
-        for (int i = 0; i < n; ++i)
+    if (histogram)
+        for (i = 0; i < n; ++i)
         {
-            free(mode[i]);
+            free(histogram[i]);
         }
-    free(mode);
-    for (i = 0; i < n; ++i) {
-        if (aux[i]->iter) hts_itr_destroy(aux[i]->iter);
-        hts_idx_destroy(idx[i]);
-        bam_hdr_destroy(aux[i]->header);
-        sam_close(aux[i]->fp);
-        free(aux[i]);
-    }
-    free(aux); free(idx);
+    free(histogram);
+    if (idx)
+        for (i = 0; i < n; ++i)
+            hts_idx_destroy(idx[i]);
+    free(idx);
+    if (aux)
+        for (i = 0; i < n; ++i) {
+            if (aux[i]->iter) hts_itr_destroy(aux[i]->iter);
+            bam_hdr_destroy(aux[i]->header);
+            sam_close(aux[i]->fp);
+            free(aux[i]);
+        }
+    free(aux);
     free(str.s);
     sam_global_args_free(&ga);
-    return 0;
+    return status;
 }
