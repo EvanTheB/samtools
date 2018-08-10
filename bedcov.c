@@ -226,16 +226,16 @@ int main_bedcov(int argc, char *argv[])
 
                     unsigned depth = n_plp[i] - m;
                     cnt[i] += depth;
-                    if (depth > histogram_size) {
+                    if (depth >= histogram_size) {
                         size_t old_size = histogram_size;
                         histogram_size = depth * 2;
-                        for (i = 0; i < n; ++i) {
-                            int64_t *new = realloc(histogram, histogram_size * sizeof **histogram);
+                        for (j = 0; j < n; ++j) {
+                            int64_t *new = realloc(histogram[j], histogram_size * sizeof **histogram);
                             if (!new) {
                                 goto bed_error;
                             }
-                            histogram[i] = new;
-                            memset(histogram[i] + old_size, 0, (histogram_size - old_size) * sizeof **histogram);
+                            histogram[j] = new;
+                            memset(histogram[j] + old_size, 0, (histogram_size - old_size) * sizeof **histogram);
                         }
                     }
                     histogram[i][depth]++;
